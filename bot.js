@@ -45,7 +45,7 @@ const CONFIG = {
     
     // API
     API_PORT: process.env.PORT || 5000,
-    API_SECRET: process.env.API_SECRET || 'CGCEcPOkt0c3FJAT4rq8wFO219zV91ac',
+    API_SECRET: process.env.API_SECRET || 'RwNbyMc-dR2g6aaz8YemkbxqHh5R7E0_',
     
     // Файлы данных
     DATA_DIR: './data',
