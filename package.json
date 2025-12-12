@@ -1,0 +1,30 @@
+{
+  "name": "badgrules-discord-bot",
+  "version": "2.0.0",
+  "description": "BadgRules Discord Bot with Express API - Node.js version",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "api",
+    "express"
+  ],
+  "author": "BadgRules",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
