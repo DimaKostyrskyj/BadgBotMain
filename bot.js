@@ -1008,15 +1008,19 @@ app.get('/', (req, res) => {
 // API Routes
 app.get('/api/subscription/:userId', authenticateAPI, (req, res) => {
     const { userId } = req.params;
-    const sub = db.getSubscription(userId);
-    const banned = db.isBanned(userId);
+    const userInfo = db.getUserInfo(userId);
 
     console.log(`📡 API: Запрос подписки для ${userId}`);
+    console.log(`   Banned: ${userInfo.banned}`);
+    if (userInfo.banned) {
+        console.log(`   Ban Info:`, userInfo.ban_info);
+    }
     
     res.json({
         user_id: userId,
-        subscription: sub,
-        banned: banned
+        subscription: userInfo.subscription,
+        banned: userInfo.banned,
+        ban_info: userInfo.ban_info
     });
 });
 
