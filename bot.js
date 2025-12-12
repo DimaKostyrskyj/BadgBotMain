@@ -831,6 +831,180 @@ const authenticateAPI = (req, res, next) => {
     next();
 };
 
+// Root route - Status page
+app.get('/', (req, res) => {
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    const seconds = Math.floor(uptime % 60);
+
+    res.send(`
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BadgRules Bot API - Status</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            padding: 20px;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            max-width: 600px;
+            width: 100%;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin: 20px 0;
+            font-size: 1.2em;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            background: #00ff00;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .info {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .info-row:last-child {
+            border-bottom: none;
+        }
+        .label {
+            opacity: 0.8;
+        }
+        .value {
+            font-weight: bold;
+        }
+        .endpoints {
+            margin-top: 30px;
+        }
+        .endpoint {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+            font-family: 'Courier New', monospace;
+        }
+        .method {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .get { background: #61affe; }
+        .post { background: #49cc90; }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            opacity: 0.7;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 BadgRules Bot</h1>
+        <div class="status">
+            <div class="status-dot"></div>
+            <span>API Online</span>
+        </div>
+
+        <div class="info">
+            <div class="info-row">
+                <span class="label">Uptime:</span>
+                <span class="value">${hours}h ${minutes}m ${seconds}s</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Version:</span>
+                <span class="value">2.0.0 (Node.js)</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Bot Status:</span>
+                <span class="value">${client.user ? '✅ Connected' : '❌ Disconnected'}</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Bot Name:</span>
+                <span class="value">${client.user ? client.user.tag : 'N/A'}</span>
+            </div>
+        </div>
+
+        <div class="endpoints">
+            <h3>📡 API Endpoints:</h3>
+            
+            <div class="endpoint">
+                <span class="method get">GET</span>
+                <span>/api/health</span>
+            </div>
+
+            <div class="endpoint">
+                <span class="method get">GET</span>
+                <span>/api/subscription/:userId</span>
+            </div>
+
+            <div class="endpoint">
+                <span class="method get">GET</span>
+                <span>/api/subscriptions</span>
+            </div>
+
+            <div class="endpoint">
+                <span class="method post">POST</span>
+                <span>/api/log</span>
+            </div>
+
+            <div class="endpoint">
+                <span class="method get">GET</span>
+                <span>/api/logs</span>
+            </div>
+        </div>
+
+        <div class="footer">
+            Made with ❤️ by BadgRules Team
+        </div>
+    </div>
+</body>
+</html>
+    `);
+});
+
 // API Routes
 app.get('/api/subscription/:userId', authenticateAPI, (req, res) => {
     const { userId } = req.params;
