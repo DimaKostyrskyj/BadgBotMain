@@ -533,7 +533,28 @@ const commands = [
         .addStringOption(option =>
             option.setName('user_id')
                 .setDescription('Discord ID пользователя')
-                .setRequired(true))
+                .setRequired(true)),
+
+    // LOAD LOGS - Загрузка логов сайта
+    new SlashCommandBuilder()
+        .setName('load_logs')
+        .setDescription('📊 Загрузить логи сайта')
+        .addStringOption(option =>
+            option.setName('type')
+                .setDescription('Тип логов')
+                .setRequired(false)
+                .addChoices(
+                    { name: 'Статистика', value: 'stats' },
+                    { name: 'Все логи', value: 'all' },
+                    { name: 'Только ошибки', value: 'errors' },
+                    { name: 'Только предупреждения', value: 'warnings' }
+                ))
+        .addIntegerOption(option =>
+            option.setName('limit')
+                .setDescription('Количество логов (макс 100)')
+                .setRequired(false)
+                .setMinValue(1)
+                .setMaxValue(100))
 ].map(command => command.toJSON());
 
 // Регистрация команд
@@ -584,6 +605,8 @@ client.on('interactionCreate', async interaction => {
             await handleUserUnban(interaction);
         } else if (commandName === 'user-info') {
             await handleUserInfo(interaction);
+        } else if (commandName === 'load_logs') {
+            await handleLoadLogs(interaction);
         }
     } catch (error) {
         console.error('❌ Ошибка выполнения команды:', error);
@@ -804,6 +827,100 @@ async function handleUserInfo(interaction) {
     }
 
     await interaction.reply({ embeds: [embed], ephemeral: true });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOAD LOGS - Загрузка логов с сайта
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function handleLoadLogs(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+        const type = interaction.options.getString('type') || 'stats';
+        const limit = interaction.options.getInteger('limit') || 50;
+
+        // Запрашиваем логи через API
+        const response = await fetch(`http://localhost:${CONFIG.API_PORT}/api/website-logs?type=${type}&limit=${limit}`, {
+            headers: {
+                'x-api-secret': CONFIG.API_SECRET
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`API Error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (type === 'stats') {
+            // Показываем только статистику
+            const stats = data.stats;
+            const embed = new EmbedBuilder()
+                .setTitle('📊 Статистика логов сайта')
+                .setColor('#60a5fa')
+                .addFields(
+                    { name: '📝 Всего логов', value: `${stats.total}`, inline: true },
+                    { name: '🔴 Ошибок', value: `${stats.errors}`, inline: true },
+                    { name: '🟡 Предупреждений', value: `${stats.warnings}`, inline: true },
+                    { name: '🔵 Информации', value: `${stats.infos}`, inline: true },
+                    { name: '⏱️ Время работы', value: stats.uptime, inline: true },
+                    { name: '🚀 Запущено', value: `<t:${Math.floor(new Date(stats.startTime).getTime() / 1000)}:R>`, inline: true }
+                )
+                .setFooter({ text: 'BadgRules Logger System' })
+                .setTimestamp();
+
+            await interaction.followUp({ embeds: [embed] });
+
+        } else {
+            // Показываем логи
+            const logs = data.logs;
+            
+            if (logs.length === 0) {
+                return interaction.followUp({ content: '📭 Логов не найдено' });
+            }
+
+            // Форматируем логи в текст
+            let logText = `📊 **${type === 'all' ? 'Все логи' : type === 'errors' ? 'Ошибки' : 'Предупреждения'}** (${logs.length})\n\n`;
+            
+            logs.slice(0, 5).forEach((log, index) => {
+                const icon = {
+                    'error': '🔴',
+                    'warn': '🟡',
+                    'info': '🔵',
+                    'log': '⚪',
+                    'debug': '🟣'
+                }[log.type] || '⚪';
+
+                const timestamp = new Date(log.timestamp).toLocaleTimeString('ru-RU');
+                const shortMsg = log.message.substring(0, 150);
+                logText += `${icon} **[${log.type.toUpperCase()}]** ${timestamp}\n\`\`\`${shortMsg}${shortMsg.length >= 150 ? '...' : ''}\`\`\`\n`;
+            });
+
+            // Discord имеет лимит 2000 символов на сообщение
+            if (logText.length > 1900) {
+                logText = logText.substring(0, 1900) + '\n... (обрезано)';
+            }
+
+            await interaction.followUp({ content: logText });
+
+            // Если логов много - отправляем файлом
+            if (data.fullText && logs.length > 5) {
+                const buffer = Buffer.from(data.fullText, 'utf-8');
+                await interaction.followUp({
+                    content: `📎 Полный лог (${logs.length} записей):`,
+                    files: [{
+                        attachment: buffer,
+                        name: `badgrules_logs_${type}_${new Date().toISOString().split('T')[0]}.txt`
+                    }]
+                });
+            }
+        }
+
+    } catch (error) {
+        console.error('❌ Ошибка загрузки логов:', error);
+        await interaction.followUp({ content: `❌ Ошибка загрузки логов: ${error.message}` });
+    }
 }
 
 // Bot ready
@@ -1067,6 +1184,142 @@ app.get('/api/logs', authenticateAPI, (req, res) => {
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEBSITE LOGS API - Логи с сайта
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// In-memory хранилище логов с сайта
+let websiteLogs = {
+    logs: [],
+    errors: [],
+    warnings: [],
+    infos: [],
+    stats: {
+        total: 0,
+        errors: 0,
+        warnings: 0,
+        infos: 0,
+        startTime: new Date().toISOString(),
+        uptime: '0h 0m 0s'
+    }
+};
+
+const serverStartTime = new Date();
+
+function getTimeSinceStart() {
+    const diff = new Date() - serverStartTime;
+    const seconds = Math.floor(diff / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+}
+
+function exportLogsToText(logs, type) {
+    let output = '';
+    output += '╔════════════════════════════════════════════════════════════════╗\n';
+    output += '║              BADGRULES - ЛОГИ САЙТА                            ║\n';
+    output += '╚════════════════════════════════════════════════════════════════╝\n\n';
+    output += `📊 Тип: ${type}\n`;
+    output += `📝 Количество: ${logs.length}\n`;
+    output += `⏱️ Время работы: ${getTimeSinceStart()}\n\n`;
+    output += '─'.repeat(70) + '\n\n';
+
+    logs.forEach((log) => {
+        const icon = { 'error': '🔴', 'warn': '🟡', 'info': '🔵', 'log': '⚪', 'debug': '🟣' }[log.type] || '⚪';
+        output += `${icon} [${log.type.toUpperCase()}] ${log.timeFromStart || ''}\n`;
+        output += `   ${new Date(log.timestamp).toLocaleString('ru-RU')}\n`;
+        output += `   ${log.message}\n\n`;
+    });
+
+    return output;
+}
+
+// POST /api/website-log - Принимает логи с фронтенда
+app.post('/api/website-log', (req, res) => {
+    const { type, message, timestamp } = req.body;
+    
+    if (!type || !message) {
+        return res.status(400).json({ error: 'Type and message required' });
+    }
+
+    const logEntry = {
+        type,
+        message,
+        timestamp: timestamp || new Date().toISOString(),
+        timeFromStart: getTimeSinceStart()
+    };
+
+    websiteLogs.logs.push(logEntry);
+    
+    switch(type) {
+        case 'error':
+            websiteLogs.errors.push(logEntry);
+            websiteLogs.stats.errors++;
+            break;
+        case 'warn':
+            websiteLogs.warnings.push(logEntry);
+            websiteLogs.stats.warnings++;
+            break;
+        case 'info':
+            websiteLogs.infos.push(logEntry);
+            websiteLogs.stats.infos++;
+            break;
+    }
+
+    websiteLogs.stats.total++;
+
+    // Ограничиваем размер (последние 1000 логов)
+    if (websiteLogs.logs.length > 1000) websiteLogs.logs.shift();
+    if (websiteLogs.errors.length > 500) websiteLogs.errors.shift();
+    if (websiteLogs.warnings.length > 500) websiteLogs.warnings.shift();
+
+    res.json({ status: 'ok', logged: true });
+});
+
+// GET /api/website-logs - Получить логи
+app.get('/api/website-logs', authenticateAPI, (req, res) => {
+    const type = req.query.type || 'all';
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+
+    let logsToReturn;
+    
+    switch(type) {
+        case 'errors':
+            logsToReturn = websiteLogs.errors.slice(-limit).reverse();
+            break;
+        case 'warnings':
+            logsToReturn = websiteLogs.warnings.slice(-limit).reverse();
+            break;
+        case 'info':
+            logsToReturn = websiteLogs.infos.slice(-limit).reverse();
+            break;
+        case 'stats':
+            websiteLogs.stats.uptime = getTimeSinceStart();
+            return res.json({ stats: websiteLogs.stats });
+        default:
+            logsToReturn = websiteLogs.logs.slice(-limit).reverse();
+    }
+
+    const fullText = exportLogsToText(logsToReturn, type);
+    websiteLogs.stats.uptime = getTimeSinceStart();
+
+    res.json({
+        logs: logsToReturn,
+        stats: websiteLogs.stats,
+        fullText: fullText,
+        count: logsToReturn.length
+    });
+});
+
+// POST /api/website-logs/clear - Очистить логи
+app.post('/api/website-logs/clear', authenticateAPI, (req, res) => {
+    websiteLogs = {
+        logs: [], errors: [], warnings: [], infos: [],
+        stats: { total: 0, errors: 0, warnings: 0, infos: 0, startTime: new Date().toISOString(), uptime: '0h 0m 0s' }
+    };
+    res.json({ status: 'ok', message: 'Все логи очищены' });
 });
 
 // Start server
