@@ -935,11 +935,17 @@ client.once('ready', async () => {
 
 const app = express();
 
-// Middleware
+// Middleware - ИСПРАВЛЕНО: Полная поддержка CORS
 app.use(cors({
-    origin: 'https://www.badgrules.com'
+    origin: '*', // Разрешить все домены
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-secret'],
+    credentials: true
 }));
 app.use(express.json());
+
+// Обработка preflight requests
+app.options('*', cors());
 
 // Auth middleware
 const authenticateAPI = (req, res, next) => {
@@ -1242,7 +1248,11 @@ function exportLogsToText(logs, type) {
 app.post('/api/website-log', (req, res) => {
     const { type, message, timestamp } = req.body;
     
+    // Логируем получение данных
+    console.log(`📝 [WEBSITE LOG] Получен лог: [${type}] ${message ? message.substring(0, 50) : 'empty'}...`);
+    
     if (!type || !message) {
+        console.log('❌ [WEBSITE LOG] Ошибка: type или message отсутствует');
         return res.status(400).json({ error: 'Type and message required' });
     }
 
@@ -1259,10 +1269,12 @@ app.post('/api/website-log', (req, res) => {
         case 'error':
             websiteLogs.errors.push(logEntry);
             websiteLogs.stats.errors++;
+            console.log(`🔴 [WEBSITE LOG] Ошибка добавлена: ${websiteLogs.errors.length} всего`);
             break;
         case 'warn':
             websiteLogs.warnings.push(logEntry);
             websiteLogs.stats.warnings++;
+            console.log(`🟡 [WEBSITE LOG] Предупреждение добавлено: ${websiteLogs.warnings.length} всего`);
             break;
         case 'info':
             websiteLogs.infos.push(logEntry);
@@ -1271,6 +1283,8 @@ app.post('/api/website-log', (req, res) => {
     }
 
     websiteLogs.stats.total++;
+    console.log(`✅ [WEBSITE LOG] Всего логов: ${websiteLogs.stats.total}`);
+
 
     // Ограничиваем размер (последние 1000 логов)
     if (websiteLogs.logs.length > 1000) websiteLogs.logs.shift();
