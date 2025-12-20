@@ -936,7 +936,9 @@ client.once('ready', async () => {
 const app = express();
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: 'https://www.badgrules.com'
+}));
 app.use(express.json());
 
 // Auth middleware
