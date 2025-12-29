@@ -1,6 +1,6 @@
 /**
- * BadgRules Discord Bot - Node.js Version
- * =======================================
+ * BadgRules Discord Bot - Node.js Version with Debug Control
+ * ===========================================================
  * Управление пользователями через Discord + REST API для сайта
  * 
  * Команды:
@@ -16,6 +16,11 @@
  * /user tempban <user_id> <days> <reason> - Временный бан
  * /user unban <user_id> - Разбанить
  * /user info <user_id> - Инфо о пользователе
+ * 
+ * /debug enable - Включить логи (только владелец)
+ * /debug disable - Выключить логи (только владелец)
+ * /debug status - Проверить статус логирования
+ * /debug report - Получить все логи и ошибки
  */
 
 require('dotenv').config();
@@ -24,6 +29,142 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs').promises;
 const path = require('path');
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG SYSTEM - Система управления логами
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class DebugSystem {
+    constructor() {
+        this.enabled = false;
+        this.logs = [];
+        this.errors = [];
+        this.maxLogs = 1000; // Максимум логов в памяти
+        
+        // Перехватываем все console методы
+        this.originalConsole = {
+            log: console.log,
+            error: console.error,
+            warn: console.warn,
+            info: console.info,
+            debug: console.debug
+        };
+        
+        this.setupInterceptors();
+    }
+    
+    setupInterceptors() {
+        const self = this;
+        
+        console.log = (...args) => {
+            if (self.enabled) {
+                self.originalConsole.log(...args);
+            }
+            self.addLog('LOG', args);
+        };
+        
+        console.error = (...args) => {
+            if (self.enabled) {
+                self.originalConsole.error(...args);
+            }
+            self.addLog('ERROR', args);
+        };
+        
+        console.warn = (...args) => {
+            if (self.enabled) {
+                self.originalConsole.warn(...args);
+            }
+            self.addLog('WARN', args);
+        };
+        
+        console.info = (...args) => {
+            if (self.enabled) {
+                self.originalConsole.info(...args);
+            }
+            self.addLog('INFO', args);
+        };
+        
+        console.debug = (...args) => {
+            if (self.enabled) {
+                self.originalConsole.debug(...args);
+            }
+            self.addLog('DEBUG', args);
+        };
+    }
+    
+    addLog(type, args) {
+        const timestamp = new Date().toISOString();
+        const message = args.map(arg => {
+            if (typeof arg === 'object') {
+                try {
+                    return JSON.stringify(arg, null, 2);
+                } catch (e) {
+                    return String(arg);
+                }
+            }
+            return String(arg);
+        }).join(' ');
+        
+        const logEntry = {
+            timestamp,
+            type,
+            message
+        };
+        
+        if (type === 'ERROR') {
+            this.errors.push(logEntry);
+            if (this.errors.length > this.maxLogs) {
+                this.errors.shift();
+            }
+        }
+        
+        this.logs.push(logEntry);
+        if (this.logs.length > this.maxLogs) {
+            this.logs.shift();
+        }
+    }
+    
+    enable() {
+        this.enabled = true;
+        this.originalConsole.log('🔍 Debug mode ENABLED - Логи включены');
+    }
+    
+    disable() {
+        this.enabled = false;
+        this.originalConsole.log('🔒 Debug mode DISABLED - Логи выключены');
+    }
+    
+    getStatus() {
+        return {
+            enabled: this.enabled,
+            totalLogs: this.logs.length,
+            totalErrors: this.errors.length,
+            lastLog: this.logs[this.logs.length - 1] || null,
+            lastError: this.errors[this.errors.length - 1] || null
+        };
+    }
+    
+    getReport() {
+        return {
+            enabled: this.enabled,
+            logs: this.logs,
+            errors: this.errors,
+            summary: {
+                totalLogs: this.logs.length,
+                totalErrors: this.errors.length,
+                errorRate: this.logs.length > 0 ? (this.errors.length / this.logs.length * 100).toFixed(2) + '%' : '0%'
+            }
+        };
+    }
+    
+    clearLogs() {
+        this.logs = [];
+        this.errors = [];
+    }
+}
+
+// Создаем глобальную систему дебага
+const DEBUG = new DebugSystem();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // КОНФИГУРАЦИЯ
@@ -42,6 +183,7 @@ const CONFIG = {
     
     // Администраторы
     ADMIN_IDS: ['701782316623855668', '482499344982081546'],
+    OWNER_ID: '701782316623855668', // Только владелец может управлять дебагом
     
     // API
     API_PORT: process.env.PORT || 5000,
@@ -204,12 +346,12 @@ class DatabaseManager {
     }
 
     async extendSubscription(userId, days, adminId, reason = '') {
-        const sub = this.getSubscription(userId);
+        const sub = this.data.subscriptions.subscriptions[userId];
         if (!sub) return null;
 
         const currentExpires = new Date(sub.expires_at);
         const newExpires = new Date(currentExpires.getTime() + days * 24 * 60 * 60 * 1000);
-
+        
         sub.expires_at = newExpires.toISOString();
         sub.active = true;
 
@@ -228,11 +370,12 @@ class DatabaseManager {
     }
 
     async freezeSubscription(userId, adminId, reason = '') {
-        const sub = this.getSubscription(userId);
+        const sub = this.data.subscriptions.subscriptions[userId];
         if (!sub) return null;
 
         sub.frozen = true;
         sub.frozen_at = new Date().toISOString();
+        sub.frozen_by = adminId;
 
         this.data.subscriptions.history.push({
             action: 'freeze',
@@ -243,20 +386,17 @@ class DatabaseManager {
         });
 
         await this.saveAll();
+        console.log(`❄️ Подписка заморожена: ${userId}`);
         return sub;
     }
 
     async unfreezeSubscription(userId, adminId, reason = '') {
-        const sub = this.getSubscription(userId);
-        if (!sub || !sub.frozen) return null;
+        const sub = this.data.subscriptions.subscriptions[userId];
+        if (!sub) return null;
 
-        const frozenDuration = new Date() - new Date(sub.frozen_at);
-        const currentExpires = new Date(sub.expires_at);
-        const newExpires = new Date(currentExpires.getTime() + frozenDuration);
-
-        sub.expires_at = newExpires.toISOString();
         sub.frozen = false;
         delete sub.frozen_at;
+        delete sub.frozen_by;
 
         this.data.subscriptions.history.push({
             action: 'unfreeze',
@@ -267,114 +407,85 @@ class DatabaseManager {
         });
 
         await this.saveAll();
+        console.log(`🔥 Подписка разморожена: ${userId}`);
         return sub;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════
-    // USER METHODS
+    // USER MANAGEMENT METHODS
     // ═══════════════════════════════════════════════════════════════════════════════
 
-    async banUser(userId, adminId, reason = '', temporary = false, days = 0) {
+    async banUser(userId, reason, adminId, duration = null) {
+        const now = new Date();
         const ban = {
             user_id: userId,
-            banned_at: new Date().toISOString(),
-            banned_by: adminId,
             reason: reason,
-            active: true,
-            temporary: temporary
+            banned_by: adminId,
+            banned_at: now.toISOString(),
+            expires_at: duration ? new Date(now.getTime() + duration * 24 * 60 * 60 * 1000).toISOString() : null,
+            active: true
         };
 
-        if (temporary) {
-            const expires = new Date();
-            expires.setDate(expires.getDate() + days);
-            ban.expires_at = expires.toISOString();
-        }
-
-        if (!this.data.users.users[userId]) {
-            this.data.users.users[userId] = {};
-        }
-
-        this.data.users.users[userId].banned = true;
-        this.data.users.users[userId].ban_info = ban;
         this.data.users.banned.push(ban);
+        
+        if (this.data.users.users[userId]) {
+            this.data.users.users[userId].banned = true;
+        }
 
         await this.saveAll();
-        console.log(`✅ Пользователь забанен: ${userId}`);
+        console.log(`🚫 Пользователь забанен: ${userId}`);
         return ban;
     }
 
     async unbanUser(userId, adminId, reason = '') {
+        this.data.users.banned = this.data.users.banned.filter(ban => ban.user_id !== userId);
+        
         if (this.data.users.users[userId]) {
             this.data.users.users[userId].banned = false;
-            this.data.users.users[userId].unban_info = {
-                unbanned_at: new Date().toISOString(),
-                unbanned_by: adminId,
-                reason: reason
-            };
-
-            await this.saveAll();
-            console.log(`✅ Пользователь разбанен: ${userId}`);
-            return true;
         }
-        return false;
+
+        await this.saveAll();
+        console.log(`✅ Пользователь разбанен: ${userId}`);
+        return true;
     }
 
-    isBanned(userId) {
-        const user = this.data.users.users[userId];
-        if (!user || !user.banned) return false;
+    isUserBanned(userId) {
+        const ban = this.data.users.banned.find(b => b.user_id === userId && b.active);
+        if (!ban) return false;
 
-        const banInfo = user.ban_info;
-        if (banInfo && banInfo.temporary) {
-            const expires = new Date(banInfo.expires_at);
+        if (ban.expires_at) {
+            const expires = new Date(ban.expires_at);
             if (expires < new Date()) {
-                this.unbanUser(userId, 'system', 'Temporary ban expired');
+                ban.active = false;
                 return false;
             }
         }
-
         return true;
     }
 
     getUserInfo(userId) {
-        const user = this.data.users.users[userId] || {};
-        const sub = this.getSubscription(userId);
-
         return {
-            user_id: userId,
-            banned: user.banned || false,
-            ban_info: user.ban_info || null,
-            subscription: sub,
-            created_at: user.created_at || null,
-            last_login: user.last_login || null
+            user: this.data.users.users[userId] || null,
+            subscription: this.getSubscription(userId),
+            banned: this.isUserBanned(userId)
         };
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════════
-    // LOGS
-    // ═══════════════════════════════════════════════════════════════════════════════
-
-    async addLog(eventType, userId, data = {}) {
-        const log = {
-            id: Date.now().toString(),
-            event_type: eventType,
+    async addLog(action, userId, adminId, details = {}) {
+        this.data.logs.logs.push({
+            action,
             user_id: userId,
-            data: data,
+            admin_id: adminId,
+            details,
             timestamp: new Date().toISOString()
-        };
+        });
 
-        this.data.logs.logs.push(log);
-        
-        // Хранить только последние 1000 логов
-        if (this.data.logs.logs.length > 1000) {
-            this.data.logs.logs = this.data.logs.logs.slice(-1000);
+        // Ограничиваем количество логов
+        if (this.data.logs.logs.length > 10000) {
+            this.data.logs.logs = this.data.logs.logs.slice(-5000);
         }
 
         await this.saveAll();
-        return log;
-    }
-
-    getLogs(limit = 50) {
-        return this.data.logs.logs.slice(-limit).reverse();
     }
 }
 
@@ -391,969 +502,876 @@ const client = new Client({
 
 const db = new DatabaseManager();
 
-// Проверка прав админа
-function isAdmin(userId) {
-    return CONFIG.ADMIN_IDS.includes(userId);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SLASH COMMANDS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const commands = [
-    // SUB GIVE
-    new SlashCommandBuilder()
-        .setName('sub-give')
-        .setDescription('Выдать подписку пользователю')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true))
-        .addStringOption(option =>
-            option.setName('plan')
-                .setDescription('Тарифный план')
-                .setRequired(true)
-                .addChoices(
-                    { name: '1 месяц', value: '1month' },
-                    { name: '3 месяца', value: '3months' },
-                    { name: '6 месяцев', value: '6months' },
-                    { name: '1 год', value: '1year' },
-                    { name: 'Навсегда', value: 'lifetime' }
-                ))
-        .addIntegerOption(option =>
-            option.setName('days')
-                .setDescription('Количество дней (опционально)')
-                .setRequired(false))
-        .addStringOption(option =>
-            option.setName('reason')
-                .setDescription('Причина выдачи')
-                .setRequired(false)),
-
-    // SUB REMOVE
-    new SlashCommandBuilder()
-        .setName('sub-remove')
-        .setDescription('Убрать подписку у пользователя')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true))
-        .addStringOption(option =>
-            option.setName('reason')
-                .setDescription('Причина удаления')
-                .setRequired(false)),
-
-    // SUB CHECK
-    new SlashCommandBuilder()
-        .setName('sub-check')
-        .setDescription('Проверить статус подписки')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true)),
-
-    // SUB LIST
-    new SlashCommandBuilder()
-        .setName('sub-list')
-        .setDescription('Список всех подписок')
-        .addStringOption(option =>
-            option.setName('filter')
-                .setDescription('Фильтр')
-                .setRequired(false)
-                .addChoices(
-                    { name: 'Все', value: 'all' },
-                    { name: 'Активные', value: 'active' },
-                    { name: 'Истекшие', value: 'expired' },
-                    { name: 'Навсегда', value: 'lifetime' }
-                )),
-
-    // SUB EXTEND
-    new SlashCommandBuilder()
-        .setName('sub-extend')
-        .setDescription('Продлить подписку')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true))
-        .addIntegerOption(option =>
-            option.setName('days')
-                .setDescription('Количество дней')
-                .setRequired(true))
-        .addStringOption(option =>
-            option.setName('reason')
-                .setDescription('Причина продления')
-                .setRequired(false)),
-
-    // USER BAN
-    new SlashCommandBuilder()
-        .setName('user-ban')
-        .setDescription('Забанить пользователя')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true))
-        .addStringOption(option =>
-            option.setName('reason')
-                .setDescription('Причина бана')
-                .setRequired(false)),
-
-    // USER TEMPBAN
-    new SlashCommandBuilder()
-        .setName('user-tempban')
-        .setDescription('Временно забанить пользователя')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true))
-        .addIntegerOption(option =>
-            option.setName('days')
-                .setDescription('Количество дней')
-                .setRequired(true))
-        .addStringOption(option =>
-            option.setName('reason')
-                .setDescription('Причина бана')
-                .setRequired(false)),
-
-    // USER UNBAN
-    new SlashCommandBuilder()
-        .setName('user-unban')
-        .setDescription('Разбанить пользователя')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true))
-        .addStringOption(option =>
-            option.setName('reason')
-                .setDescription('Причина разбана')
-                .setRequired(false)),
-
-    // USER INFO
-    new SlashCommandBuilder()
-        .setName('user-info')
-        .setDescription('Информация о пользователе')
-        .addStringOption(option =>
-            option.setName('user_id')
-                .setDescription('Discord ID пользователя')
-                .setRequired(true)),
-
-    // LOAD LOGS - Загрузка логов сайта
-    new SlashCommandBuilder()
-        .setName('load_logs')
-        .setDescription('📊 Загрузить логи сайта')
-        .addStringOption(option =>
-            option.setName('type')
-                .setDescription('Тип логов')
-                .setRequired(false)
-                .addChoices(
-                    { name: 'Статистика', value: 'stats' },
-                    { name: 'Все логи', value: 'all' },
-                    { name: 'Только ошибки', value: 'errors' },
-                    { name: 'Только предупреждения', value: 'warnings' }
-                ))
-        .addIntegerOption(option =>
-            option.setName('limit')
-                .setDescription('Количество логов (макс 100)')
-                .setRequired(false)
-                .setMinValue(1)
-                .setMaxValue(100))
-].map(command => command.toJSON());
-
 // Регистрация команд
+const commands = [
+    // SUB команды
+    new SlashCommandBuilder()
+        .setName('sub')
+        .setDescription('Управление подписками')
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('give')
+                .setDescription('Выдать подписку')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('plan')
+                        .setDescription('Тарифный план')
+                        .setRequired(true)
+                        .addChoices(
+                            { name: '📅 1 месяц', value: '1month' },
+                            { name: '📆 3 месяца', value: '3months' },
+                            { name: '🗓️ 6 месяцев', value: '6months' },
+                            { name: '📅 1 год', value: '1year' },
+                            { name: '♾️ Навсегда', value: 'lifetime' }
+                        ))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина выдачи')
+                        .setRequired(false)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('remove')
+                .setDescription('Убрать подписку')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина удаления')
+                        .setRequired(false)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('check')
+                .setDescription('Проверить статус подписки')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('list')
+                .setDescription('Список подписок')
+                .addStringOption(option =>
+                    option.setName('filter')
+                        .setDescription('Фильтр')
+                        .setRequired(false)
+                        .addChoices(
+                            { name: 'Все', value: 'all' },
+                            { name: 'Активные', value: 'active' },
+                            { name: 'Истекшие', value: 'expired' },
+                            { name: 'Навсегда', value: 'lifetime' }
+                        )))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('extend')
+                .setDescription('Продлить подписку')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addIntegerOption(option =>
+                    option.setName('days')
+                        .setDescription('Количество дней')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина продления')
+                        .setRequired(false)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('freeze')
+                .setDescription('Заморозить подписку')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина заморозки')
+                        .setRequired(false)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('unfreeze')
+                .setDescription('Разморозить подписку')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина разморозки')
+                        .setRequired(false))),
+
+    // USER команды
+    new SlashCommandBuilder()
+        .setName('user')
+        .setDescription('Управление пользователями')
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('ban')
+                .setDescription('Забанить пользователя')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина бана')
+                        .setRequired(true)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('tempban')
+                .setDescription('Временный бан')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addIntegerOption(option =>
+                    option.setName('days')
+                        .setDescription('Количество дней')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина бана')
+                        .setRequired(true)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('unban')
+                .setDescription('Разбанить пользователя')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('reason')
+                        .setDescription('Причина разбана')
+                        .setRequired(false)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('info')
+                .setDescription('Информация о пользователе')
+                .addStringOption(option =>
+                    option.setName('user_id')
+                        .setDescription('Discord ID пользователя')
+                        .setRequired(true))),
+
+    // DEBUG команды
+    new SlashCommandBuilder()
+        .setName('debug')
+        .setDescription('Управление системой логирования (только владелец)')
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('enable')
+                .setDescription('Включить логи'))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('disable')
+                .setDescription('Выключить логи'))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('status')
+                .setDescription('Статус системы логирования'))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('report')
+                .setDescription('Получить полный отчет по логам'))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('clear')
+                .setDescription('Очистить все логи'))
+];
+
+// Регистрация команд в Discord
 async function registerCommands() {
-    const rest = new REST({ version: '10' }).setToken(CONFIG.BOT_TOKEN);
-    
     try {
-        console.log('🔄 Регистрация slash команд...');
+        const rest = new REST({ version: '10' }).setToken(CONFIG.BOT_TOKEN);
+        
+        console.log('🔄 Регистрация команд...');
         
         await rest.put(
             Routes.applicationGuildCommands(CONFIG.CLIENT_ID, CONFIG.GUILD_ID),
             { body: commands }
         );
         
-        console.log(`✅ Зарегистрировано ${commands.length} команд`);
+        console.log('✅ Команды зарегистрированы');
     } catch (error) {
         console.error('❌ Ошибка регистрации команд:', error);
     }
 }
 
-// Обработчики команд
-client.on('interactionCreate', async interaction => {
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMAND HANDLERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
     const { commandName, user } = interaction;
+    const adminId = user.id;
 
-    // Проверка прав
-    if (!isAdmin(user.id)) {
-        return interaction.reply({ content: '❌ У вас нет прав!', ephemeral: true });
+    // Проверка прав администратора для всех команд кроме debug
+    if (commandName !== 'debug' && !CONFIG.ADMIN_IDS.includes(adminId)) {
+        return interaction.reply({
+            content: '❌ У вас нет прав для использования этой команды',
+            ephemeral: true
+        });
+    }
+
+    // Проверка прав владельца для debug команд
+    if (commandName === 'debug' && adminId !== CONFIG.OWNER_ID) {
+        return interaction.reply({
+            content: '❌ Только владелец бота может управлять системой логирования',
+            ephemeral: true
+        });
     }
 
     try {
-        if (commandName === 'sub-give') {
-            await handleSubGive(interaction);
-        } else if (commandName === 'sub-remove') {
-            await handleSubRemove(interaction);
-        } else if (commandName === 'sub-check') {
-            await handleSubCheck(interaction);
-        } else if (commandName === 'sub-list') {
-            await handleSubList(interaction);
-        } else if (commandName === 'sub-extend') {
-            await handleSubExtend(interaction);
-        } else if (commandName === 'user-ban') {
-            await handleUserBan(interaction);
-        } else if (commandName === 'user-tempban') {
-            await handleUserTempban(interaction);
-        } else if (commandName === 'user-unban') {
-            await handleUserUnban(interaction);
-        } else if (commandName === 'user-info') {
-            await handleUserInfo(interaction);
-        } else if (commandName === 'load_logs') {
-            await handleLoadLogs(interaction);
+        if (commandName === 'sub') {
+            await handleSubCommand(interaction);
+        } else if (commandName === 'user') {
+            await handleUserCommand(interaction);
+        } else if (commandName === 'debug') {
+            await handleDebugCommand(interaction);
         }
     } catch (error) {
-        console.error('❌ Ошибка выполнения команды:', error);
-        await interaction.reply({ content: '❌ Произошла ошибка!', ephemeral: true });
+        console.error(`❌ Ошибка выполнения команды ${commandName}:`, error);
+        
+        const errorEmbed = new EmbedBuilder()
+            .setColor(0xef4444)
+            .setTitle('❌ Ошибка')
+            .setDescription('Произошла ошибка при выполнении команды')
+            .addFields({ name: 'Ошибка', value: `\`\`\`${error.message}\`\`\`` })
+            .setTimestamp();
+
+        if (interaction.replied || interaction.deferred) {
+            await interaction.editReply({ embeds: [errorEmbed] });
+        } else {
+            await interaction.reply({ embeds: [errorEmbed], ephemeral: true });
+        }
     }
 });
 
-// Command Handlers
-async function handleSubGive(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const userId = interaction.options.getString('user_id');
-    const plan = interaction.options.getString('plan');
-    const customDays = interaction.options.getInteger('days');
-    const reason = interaction.options.getString('reason') || 'Выдано администратором';
-
-    const days = customDays || PLANS[plan].days;
-    const sub = await db.grantSubscription(userId, plan, days, interaction.user.id, reason);
-
-    const embed = new EmbedBuilder()
-        .setTitle('💎 Подписка выдана')
-        .setDescription(`**User ID:** \`${userId}\`\n**План:** ${PLANS[plan].emoji} ${PLANS[plan].name}\n**Дней:** ${days}\n**Истекает:** <t:${Math.floor(new Date(sub.expires_at).getTime() / 1000)}:R>`)
-        .addFields({ name: 'Причина', value: reason })
-        .setColor('#00ff00')
-        .setFooter({ text: `Выдал: ${interaction.user.username}` })
-        .setTimestamp();
-
-    await interaction.followUp({ embeds: [embed] });
-
-    // Отправить в канал
-    const channel = client.channels.cache.get(CONFIG.SUBS_CHANNEL_ID);
-    if (channel) await channel.send({ embeds: [embed] });
-}
-
-async function handleSubRemove(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const userId = interaction.options.getString('user_id');
-    const reason = interaction.options.getString('reason') || 'Удалено администратором';
-
-    const success = await db.removeSubscription(userId, interaction.user.id, reason);
-
-    if (success) {
-        const embed = new EmbedBuilder()
-            .setTitle('🗑️ Подписка удалена')
-            .setDescription(`**User ID:** \`${userId}\``)
-            .addFields({ name: 'Причина', value: reason })
-            .setColor('#ff0000')
-            .setFooter({ text: `Удалил: ${interaction.user.username}` })
-            .setTimestamp();
-
-        await interaction.followUp({ embeds: [embed] });
-    } else {
-        await interaction.followUp({ content: '❌ Подписка не найдена!' });
-    }
-}
-
-async function handleSubCheck(interaction) {
-    const userId = interaction.options.getString('user_id');
-    const sub = db.getSubscription(userId);
-
-    if (!sub) {
-        return interaction.reply({ content: '❌ Подписка не найдена!', ephemeral: true });
-    }
-
-    const expires = new Date(sub.expires_at);
-    const now = new Date();
-    const daysLeft = Math.ceil((expires - now) / (1000 * 60 * 60 * 24));
-
-    const embed = new EmbedBuilder()
-        .setTitle('💎 Информация о подписке')
-        .setDescription(`**User ID:** \`${userId}\``)
-        .addFields(
-            { name: 'Тип', value: sub.type === 'lifetime' ? '♾️ Навсегда' : '💎 PRO', inline: true },
-            { name: 'План', value: sub.plan, inline: true },
-            { name: 'Активна', value: sub.active ? '✅ Да' : '❌ Нет', inline: true },
-            { name: 'Выдана', value: `<t:${Math.floor(new Date(sub.granted_at).getTime() / 1000)}:R>`, inline: true },
-            { name: 'Истекает', value: `<t:${Math.floor(expires.getTime() / 1000)}:R>`, inline: true },
-            { name: 'Осталось', value: daysLeft > 0 ? `${daysLeft} дней` : 'Истекла', inline: true }
-        )
-        .setColor('#00ff00')
-        .setTimestamp();
-
-    await interaction.reply({ embeds: [embed], ephemeral: true });
-}
-
-async function handleSubList(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const filter = interaction.options.getString('filter') || 'all';
-    const subs = db.getAllSubscriptions(filter);
-    const count = Object.keys(subs).length;
-
-    if (count === 0) {
-        return interaction.followUp({ content: '❌ Подписки не найдены!' });
-    }
-
-    const list = Object.entries(subs)
-        .slice(0, 20)
-        .map(([userId, sub]) => {
-            const expires = new Date(sub.expires_at);
-            return `• \`${userId}\` - ${sub.type === 'lifetime' ? '♾️' : '💎'} ${sub.plan} (до <t:${Math.floor(expires.getTime() / 1000)}:d>)`;
-        })
-        .join('\n');
-
-    const embed = new EmbedBuilder()
-        .setTitle(`📋 Список подписок (${count})`)
-        .setDescription(list + (count > 20 ? `\n\n*... и ещё ${count - 20}*` : ''))
-        .setColor('#00ff00')
-        .setTimestamp();
-
-    await interaction.followUp({ embeds: [embed] });
-}
-
-async function handleSubExtend(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const userId = interaction.options.getString('user_id');
-    const days = interaction.options.getInteger('days');
-    const reason = interaction.options.getString('reason') || 'Продлено администратором';
-
-    const sub = await db.extendSubscription(userId, days, interaction.user.id, reason);
-
-    if (sub) {
-        const embed = new EmbedBuilder()
-            .setTitle('⏰ Подписка продлена')
-            .setDescription(`**User ID:** \`${userId}\`\n**Продлено на:** ${days} дней\n**Новая дата:** <t:${Math.floor(new Date(sub.expires_at).getTime() / 1000)}:R>`)
-            .addFields({ name: 'Причина', value: reason })
-            .setColor('#00ff00')
-            .setTimestamp();
-
-        await interaction.followUp({ embeds: [embed] });
-    } else {
-        await interaction.followUp({ content: '❌ Подписка не найдена!' });
-    }
-}
-
-async function handleUserBan(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const userId = interaction.options.getString('user_id');
-    const reason = interaction.options.getString('reason') || 'Нарушение правил';
-
-    await db.banUser(userId, interaction.user.id, reason);
-
-    const embed = new EmbedBuilder()
-        .setTitle('🔨 Пользователь забанен')
-        .setDescription(`**User ID:** \`${userId}\``)
-        .addFields({ name: 'Причина', value: reason })
-        .setColor('#ff0000')
-        .setFooter({ text: `Забанил: ${interaction.user.username}` })
-        .setTimestamp();
-
-    await interaction.followUp({ embeds: [embed] });
-
-    const channel = client.channels.cache.get(CONFIG.BAN_CHANNEL_ID);
-    if (channel) await channel.send({ embeds: [embed] });
-}
-
-async function handleUserTempban(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const userId = interaction.options.getString('user_id');
-    const days = interaction.options.getInteger('days');
-    const reason = interaction.options.getString('reason') || 'Временное нарушение';
-
-    await db.banUser(userId, interaction.user.id, reason, true, days);
-
-    const embed = new EmbedBuilder()
-        .setTitle('⏰ Временный бан')
-        .setDescription(`**User ID:** \`${userId}\`\n**Длительность:** ${days} дней`)
-        .addFields({ name: 'Причина', value: reason })
-        .setColor('#ff9900')
-        .setFooter({ text: `Забанил: ${interaction.user.username}` })
-        .setTimestamp();
-
-    await interaction.followUp({ embeds: [embed] });
-}
-
-async function handleUserUnban(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    const userId = interaction.options.getString('user_id');
-    const reason = interaction.options.getString('reason') || 'Разбанен администратором';
-
-    const success = await db.unbanUser(userId, interaction.user.id, reason);
-
-    if (success) {
-        const embed = new EmbedBuilder()
-            .setTitle('✅ Пользователь разбанен')
-            .setDescription(`**User ID:** \`${userId}\``)
-            .addFields({ name: 'Причина', value: reason })
-            .setColor('#00ff00')
-            .setTimestamp();
-
-        await interaction.followUp({ embeds: [embed] });
-    } else {
-        await interaction.followUp({ content: '❌ Пользователь не найден!' });
-    }
-}
-
-async function handleUserInfo(interaction) {
-    const userId = interaction.options.getString('user_id');
-    const info = db.getUserInfo(userId);
-
-    const embed = new EmbedBuilder()
-        .setTitle('👤 Информация о пользователе')
-        .setDescription(`**User ID:** \`${userId}\``)
-        .addFields(
-            { name: 'Забанен', value: info.banned ? '🔨 Да' : '✅ Нет', inline: true },
-            { name: 'Подписка', value: info.subscription ? `${info.subscription.type === 'lifetime' ? '♾️' : '💎'} ${info.subscription.plan}` : '⚡ FREE', inline: true }
-        )
-        .setColor('#0099ff')
-        .setTimestamp();
-
-    if (info.banned && info.ban_info) {
-        embed.addFields({ name: 'Причина бана', value: info.ban_info.reason || 'Не указана' });
-    }
-
-    await interaction.reply({ embeds: [embed], ephemeral: true });
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// LOAD LOGS - Загрузка логов с сайта
+// DEBUG COMMAND HANDLER
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function handleLoadLogs(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+async function handleDebugCommand(interaction) {
+    const subcommand = interaction.options.getSubcommand();
 
-    try {
-        const type = interaction.options.getString('type') || 'stats';
-        const limit = interaction.options.getInteger('limit') || 50;
+    if (subcommand === 'enable') {
+        DEBUG.enable();
+        
+        const embed = new EmbedBuilder()
+            .setColor(0x22c55e)
+            .setTitle('🔍 Debug Mode Enabled')
+            .setDescription('Система логирования **включена**\nВсе логи и ошибки теперь отображаются')
+            .addFields(
+                { name: '📊 Статус', value: '```Enabled: ✅\nВидимость: Полная```' }
+            )
+            .setTimestamp();
 
-        // Запрашиваем логи через API
-        const response = await fetch(`http://localhost:${CONFIG.API_PORT}/api/website-logs?type=${type}&limit=${limit}`, {
-            headers: {
-                'x-api-secret': CONFIG.API_SECRET
-            }
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+
+    } else if (subcommand === 'disable') {
+        DEBUG.disable();
+        
+        const embed = new EmbedBuilder()
+            .setColor(0xef4444)
+            .setTitle('🔒 Debug Mode Disabled')
+            .setDescription('Система логирования **выключена**\nВсе логи и ошибки скрыты (но записываются)')
+            .addFields(
+                { name: '📊 Статус', value: '```Enabled: ❌\nВидимость: Скрыта```' }
+            )
+            .setTimestamp();
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+
+    } else if (subcommand === 'status') {
+        const status = DEBUG.getStatus();
+        
+        const embed = new EmbedBuilder()
+            .setColor(status.enabled ? 0x22c55e : 0x6b7280)
+            .setTitle('📊 Debug System Status')
+            .setDescription(`Текущий статус системы логирования`)
+            .addFields(
+                { name: '🔍 Режим', value: `\`\`\`${status.enabled ? '✅ Включен' : '❌ Выключен'}\`\`\``, inline: true },
+                { name: '📝 Всего логов', value: `\`\`\`${status.totalLogs}\`\`\``, inline: true },
+                { name: '❌ Ошибок', value: `\`\`\`${status.totalErrors}\`\`\``, inline: true }
+            )
+            .setTimestamp();
+
+        if (status.lastLog) {
+            embed.addFields({
+                name: '📄 Последний лог',
+                value: `\`\`\`${status.lastLog.type}: ${status.lastLog.message.substring(0, 100)}...\`\`\``
+            });
+        }
+
+        if (status.lastError) {
+            embed.addFields({
+                name: '⚠️ Последняя ошибка',
+                value: `\`\`\`${status.lastError.message.substring(0, 100)}...\`\`\``
+            });
+        }
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+
+    } else if (subcommand === 'report') {
+        await interaction.deferReply({ ephemeral: true });
+        
+        const report = DEBUG.getReport();
+        
+        // Создаем файл с полным отчетом
+        const reportText = `
+═══════════════════════════════════════════════════════════════
+                    BADGRULES DEBUG REPORT
+═══════════════════════════════════════════════════════════════
+
+Время создания: ${new Date().toISOString()}
+Статус: ${report.enabled ? 'ENABLED ✅' : 'DISABLED ❌'}
+
+─────────────────────────────────────────────────────────────
+СТАТИСТИКА
+─────────────────────────────────────────────────────────────
+Всего логов: ${report.summary.totalLogs}
+Всего ошибок: ${report.summary.totalErrors}
+Процент ошибок: ${report.summary.errorRate}
+
+─────────────────────────────────────────────────────────────
+ОШИБКИ (${report.errors.length})
+─────────────────────────────────────────────────────────────
+${report.errors.map((err, i) => `
+[${i + 1}] ${err.timestamp}
+TYPE: ${err.type}
+MESSAGE: ${err.message}
+${'─'.repeat(60)}
+`).join('\n')}
+
+─────────────────────────────────────────────────────────────
+ВСЕ ЛОГИ (последние 500)
+─────────────────────────────────────────────────────────────
+${report.logs.slice(-500).map((log, i) => `
+[${i + 1}] ${log.timestamp} | ${log.type}
+${log.message}
+${'─'.repeat(60)}
+`).join('\n')}
+
+═══════════════════════════════════════════════════════════════
+                    END OF REPORT
+═══════════════════════════════════════════════════════════════
+        `;
+
+        // Сохраняем отчет во временный файл
+        const reportPath = path.join(__dirname, 'debug-report.txt');
+        await fs.writeFile(reportPath, reportText, 'utf8');
+
+        const embed = new EmbedBuilder()
+            .setColor(0x3b82f6)
+            .setTitle('📋 Debug Report Generated')
+            .setDescription('Полный отчет по логам и ошибкам')
+            .addFields(
+                { name: '📊 Всего логов', value: `\`${report.summary.totalLogs}\``, inline: true },
+                { name: '❌ Всего ошибок', value: `\`${report.summary.totalErrors}\``, inline: true },
+                { name: '📈 Процент ошибок', value: `\`${report.summary.errorRate}\``, inline: true }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ 
+            embeds: [embed],
+            files: [{
+                attachment: reportPath,
+                name: `debug-report-${Date.now()}.txt`
+            }]
         });
 
-        if (!response.ok) {
-            throw new Error(`API Error: ${response.status}`);
-        }
-
-        const data = await response.json();
-
-        if (type === 'stats') {
-            // Показываем только статистику
-            const stats = data.stats;
-            const embed = new EmbedBuilder()
-                .setTitle('📊 Статистика логов сайта')
-                .setColor('#60a5fa')
-                .addFields(
-                    { name: '📝 Всего логов', value: `${stats.total}`, inline: true },
-                    { name: '🔴 Ошибок', value: `${stats.errors}`, inline: true },
-                    { name: '🟡 Предупреждений', value: `${stats.warnings}`, inline: true },
-                    { name: '🔵 Информации', value: `${stats.infos}`, inline: true },
-                    { name: '⏱️ Время работы', value: stats.uptime, inline: true },
-                    { name: '🚀 Запущено', value: `<t:${Math.floor(new Date(stats.startTime).getTime() / 1000)}:R>`, inline: true }
-                )
-                .setFooter({ text: 'BadgRules Logger System' })
-                .setTimestamp();
-
-            await interaction.followUp({ embeds: [embed] });
-
-        } else {
-            // Показываем логи
-            const logs = data.logs;
-            
-            if (logs.length === 0) {
-                return interaction.followUp({ content: '📭 Логов не найдено' });
+        // Удаляем временный файл после отправки
+        setTimeout(async () => {
+            try {
+                await fs.unlink(reportPath);
+            } catch (e) {
+                // Игнорируем ошибки удаления
             }
+        }, 5000);
 
-            // Форматируем логи в текст
-            let logText = `📊 **${type === 'all' ? 'Все логи' : type === 'errors' ? 'Ошибки' : 'Предупреждения'}** (${logs.length})\n\n`;
-            
-            logs.slice(0, 5).forEach((log, index) => {
-                const icon = {
-                    'error': '🔴',
-                    'warn': '🟡',
-                    'info': '🔵',
-                    'log': '⚪',
-                    'debug': '🟣'
-                }[log.type] || '⚪';
+    } else if (subcommand === 'clear') {
+        const oldCount = {
+            logs: DEBUG.logs.length,
+            errors: DEBUG.errors.length
+        };
+        
+        DEBUG.clearLogs();
+        
+        const embed = new EmbedBuilder()
+            .setColor(0x22c55e)
+            .setTitle('🗑️ Logs Cleared')
+            .setDescription('Все логи и ошибки очищены')
+            .addFields(
+                { name: '📝 Удалено логов', value: `\`${oldCount.logs}\``, inline: true },
+                { name: '❌ Удалено ошибок', value: `\`${oldCount.errors}\``, inline: true }
+            )
+            .setTimestamp();
 
-                const timestamp = new Date(log.timestamp).toLocaleTimeString('ru-RU');
-                const shortMsg = log.message.substring(0, 150);
-                logText += `${icon} **[${log.type.toUpperCase()}]** ${timestamp}\n\`\`\`${shortMsg}${shortMsg.length >= 150 ? '...' : ''}\`\`\`\n`;
-            });
-
-            // Discord имеет лимит 2000 символов на сообщение
-            if (logText.length > 1900) {
-                logText = logText.substring(0, 1900) + '\n... (обрезано)';
-            }
-
-            await interaction.followUp({ content: logText });
-
-            // Если логов много - отправляем файлом
-            if (data.fullText && logs.length > 5) {
-                const buffer = Buffer.from(data.fullText, 'utf-8');
-                await interaction.followUp({
-                    content: `📎 Полный лог (${logs.length} записей):`,
-                    files: [{
-                        attachment: buffer,
-                        name: `badgrules_logs_${type}_${new Date().toISOString().split('T')[0]}.txt`
-                    }]
-                });
-            }
-        }
-
-    } catch (error) {
-        console.error('❌ Ошибка загрузки логов:', error);
-        await interaction.followUp({ content: `❌ Ошибка загрузки логов: ${error.message}` });
+        await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 }
 
-// Bot ready
-client.once('ready', async () => {
-    console.log(`✅ Бот запущен: ${client.user.tag}`);
-    await registerCommands();
-});
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUB COMMAND HANDLER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function handleSubCommand(interaction) {
+    const subcommand = interaction.options.getSubcommand();
+    const adminId = interaction.user.id;
+
+    if (subcommand === 'give') {
+        const userId = interaction.options.getString('user_id');
+        const plan = interaction.options.getString('plan');
+        const reason = interaction.options.getString('reason') || 'Не указана';
+
+        await interaction.deferReply();
+
+        const planInfo = PLANS[plan];
+        if (!planInfo) {
+            return interaction.editReply({ content: '❌ Неверный тарифный план' });
+        }
+
+        const sub = await db.grantSubscription(userId, plan, planInfo.days, adminId, reason);
+
+        const embed = new EmbedBuilder()
+            .setColor(0x22c55e)
+            .setTitle('✅ Подписка выдана')
+            .setDescription(`Подписка успешно выдана пользователю <@${userId}>`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '📦 План', value: `${planInfo.emoji} ${planInfo.name}`, inline: true },
+                { name: '⏳ Срок', value: planInfo.days >= 36500 ? 'Навсегда' : `${planInfo.days} дней`, inline: true },
+                { name: '📅 Истекает', value: `<t:${Math.floor(new Date(sub.expires_at).getTime() / 1000)}:F>`, inline: false },
+                { name: '💼 Выдал', value: `<@${adminId}>`, inline: true },
+                { name: '📝 Причина', value: reason, inline: true }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.SUBS_CHANNEL_ID, embed);
+
+    } else if (subcommand === 'remove') {
+        const userId = interaction.options.getString('user_id');
+        const reason = interaction.options.getString('reason') || 'Не указана';
+
+        await interaction.deferReply();
+
+        const removed = await db.removeSubscription(userId, adminId, reason);
+
+        if (!removed) {
+            return interaction.editReply({ content: '❌ У пользователя нет подписки' });
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor(0xef4444)
+            .setTitle('🗑️ Подписка удалена')
+            .setDescription(`Подписка удалена у пользователя <@${userId}>`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '💼 Удалил', value: `<@${adminId}>`, inline: true },
+                { name: '📝 Причина', value: reason, inline: false }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.SUBS_CHANNEL_ID, embed);
+
+    } else if (subcommand === 'check') {
+        const userId = interaction.options.getString('user_id');
+        const sub = db.getSubscription(userId);
+
+        if (!sub) {
+            return interaction.reply({
+                content: `❌ У пользователя <@${userId}> нет подписки`,
+                ephemeral: true
+            });
+        }
+
+        const expires = new Date(sub.expires_at);
+        const now = new Date();
+        const daysLeft = Math.ceil((expires - now) / (1000 * 60 * 60 * 24));
+        const isActive = expires > now && sub.active && !sub.frozen;
+
+        const embed = new EmbedBuilder()
+            .setColor(isActive ? 0x22c55e : 0xef4444)
+            .setTitle('📊 Статус подписки')
+            .setDescription(`Информация о подписке <@${userId}>`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '📦 План', value: sub.plan, inline: true },
+                { name: '🎯 Тип', value: sub.type, inline: true },
+                { name: '✅ Активна', value: isActive ? 'Да' : 'Нет', inline: true },
+                { name: '❄️ Заморожена', value: sub.frozen ? 'Да' : 'Нет', inline: true },
+                { name: '⏳ Осталось дней', value: daysLeft > 0 ? `${daysLeft}` : 'Истекла', inline: true },
+                { name: '📅 Выдана', value: `<t:${Math.floor(new Date(sub.granted_at).getTime() / 1000)}:F>`, inline: false },
+                { name: '📅 Истекает', value: `<t:${Math.floor(expires.getTime() / 1000)}:F>`, inline: false }
+            )
+            .setTimestamp();
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+
+    } else if (subcommand === 'list') {
+        const filter = interaction.options.getString('filter') || 'all';
+        const subs = db.getAllSubscriptions(filter);
+        const subsArray = Object.entries(subs);
+
+        if (subsArray.length === 0) {
+            return interaction.reply({
+                content: '📭 Подписок не найдено',
+                ephemeral: true
+            });
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor(0x3b82f6)
+            .setTitle('📋 Список подписок')
+            .setDescription(`Фильтр: **${filter}**\nВсего: **${subsArray.length}**`)
+            .setTimestamp();
+
+        // Показываем первые 10 подписок
+        subsArray.slice(0, 10).forEach(([userId, sub]) => {
+            const expires = new Date(sub.expires_at);
+            const now = new Date();
+            const daysLeft = Math.ceil((expires - now) / (1000 * 60 * 60 * 24));
+            const status = expires > now && sub.active ? '✅' : '❌';
+
+            embed.addFields({
+                name: `${status} <@${userId}>`,
+                value: `План: ${sub.plan} | Дней: ${daysLeft > 0 ? daysLeft : 'Истекла'}`,
+                inline: false
+            });
+        });
+
+        if (subsArray.length > 10) {
+            embed.setFooter({ text: `Показано 10 из ${subsArray.length} подписок` });
+        }
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+
+    } else if (subcommand === 'extend') {
+        const userId = interaction.options.getString('user_id');
+        const days = interaction.options.getInteger('days');
+        const reason = interaction.options.getString('reason') || 'Не указана';
+
+        await interaction.deferReply();
+
+        const sub = await db.extendSubscription(userId, days, adminId, reason);
+
+        if (!sub) {
+            return interaction.editReply({ content: '❌ У пользователя нет подписки' });
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor(0x3b82f6)
+            .setTitle('⏰ Подписка продлена')
+            .setDescription(`Подписка продлена для <@${userId}>`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '➕ Добавлено дней', value: `${days}`, inline: true },
+                { name: '📅 Новая дата истечения', value: `<t:${Math.floor(new Date(sub.expires_at).getTime() / 1000)}:F>`, inline: false },
+                { name: '💼 Продлил', value: `<@${adminId}>`, inline: true },
+                { name: '📝 Причина', value: reason, inline: true }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.SUBS_CHANNEL_ID, embed);
+
+    } else if (subcommand === 'freeze') {
+        const userId = interaction.options.getString('user_id');
+        const reason = interaction.options.getString('reason') || 'Не указана';
+
+        await interaction.deferReply();
+
+        const sub = await db.freezeSubscription(userId, adminId, reason);
+
+        if (!sub) {
+            return interaction.editReply({ content: '❌ У пользователя нет подписки' });
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor(0x6366f1)
+            .setTitle('❄️ Подписка заморожена')
+            .setDescription(`Подписка заморожена для <@${userId}>`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '💼 Заморозил', value: `<@${adminId}>`, inline: true },
+                { name: '📝 Причина', value: reason, inline: false }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.SUBS_CHANNEL_ID, embed);
+
+    } else if (subcommand === 'unfreeze') {
+        const userId = interaction.options.getString('user_id');
+        const reason = interaction.options.getString('reason') || 'Не указана';
+
+        await interaction.deferReply();
+
+        const sub = await db.unfreezeSubscription(userId, adminId, reason);
+
+        if (!sub) {
+            return interaction.editReply({ content: '❌ У пользователя нет подписки' });
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor(0x22c55e)
+            .setTitle('🔥 Подписка разморожена')
+            .setDescription(`Подписка разморожена для <@${userId}>`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '💼 Разморозил', value: `<@${adminId}>`, inline: true },
+                { name: '📝 Причина', value: reason, inline: false }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.SUBS_CHANNEL_ID, embed);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// EXPRESS API SERVER
+// USER COMMAND HANDLER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function handleUserCommand(interaction) {
+    const subcommand = interaction.options.getSubcommand();
+    const adminId = interaction.user.id;
+
+    if (subcommand === 'ban') {
+        const userId = interaction.options.getString('user_id');
+        const reason = interaction.options.getString('reason');
+
+        await interaction.deferReply();
+
+        const ban = await db.banUser(userId, reason, adminId);
+
+        const embed = new EmbedBuilder()
+            .setColor(0xef4444)
+            .setTitle('🚫 Пользователь забанен')
+            .setDescription(`Пользователь <@${userId}> был забанен`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '💼 Забанил', value: `<@${adminId}>`, inline: true },
+                { name: '📝 Причина', value: reason, inline: false },
+                { name: '⏰ Срок', value: 'Навсегда', inline: true }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.BAN_CHANNEL_ID, embed);
+
+    } else if (subcommand === 'tempban') {
+        const userId = interaction.options.getString('user_id');
+        const days = interaction.options.getInteger('days');
+        const reason = interaction.options.getString('reason');
+
+        await interaction.deferReply();
+
+        const ban = await db.banUser(userId, reason, adminId, days);
+
+        const embed = new EmbedBuilder()
+            .setColor(0xf59e0b)
+            .setTitle('⏰ Временный бан')
+            .setDescription(`Пользователь <@${userId}> забанен на ${days} дней`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '💼 Забанил', value: `<@${adminId}>`, inline: true },
+                { name: '⏳ Срок', value: `${days} дней`, inline: true },
+                { name: '📅 До', value: `<t:${Math.floor(new Date(ban.expires_at).getTime() / 1000)}:F>`, inline: false },
+                { name: '📝 Причина', value: reason, inline: false }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.BAN_CHANNEL_ID, embed);
+
+    } else if (subcommand === 'unban') {
+        const userId = interaction.options.getString('user_id');
+        const reason = interaction.options.getString('reason') || 'Не указана';
+
+        await interaction.deferReply();
+
+        await db.unbanUser(userId, adminId, reason);
+
+        const embed = new EmbedBuilder()
+            .setColor(0x22c55e)
+            .setTitle('✅ Пользователь разбанен')
+            .setDescription(`Бан снят с пользователя <@${userId}>`)
+            .addFields(
+                { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
+                { name: '💼 Разбанил', value: `<@${adminId}>`, inline: true },
+                { name: '📝 Причина', value: reason, inline: false }
+            )
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+        await logToChannel(CONFIG.BAN_CHANNEL_ID, embed);
+
+    } else if (subcommand === 'info') {
+        const userId = interaction.options.getString('user_id');
+        const info = db.getUserInfo(userId);
+
+        const embed = new EmbedBuilder()
+            .setColor(0x3b82f6)
+            .setTitle('📊 Информация о пользователе')
+            .setDescription(`Полная информация о <@${userId}>`)
+            .addFields(
+                { name: '👤 ID', value: userId, inline: true },
+                { name: '🚫 Забанен', value: info.banned ? 'Да' : 'Нет', inline: true },
+                { name: '💎 Подписка', value: info.subscription ? 'Есть' : 'Нет', inline: true }
+            )
+            .setTimestamp();
+
+        if (info.subscription) {
+            const expires = new Date(info.subscription.expires_at);
+            const daysLeft = Math.ceil((expires - new Date()) / (1000 * 60 * 60 * 24));
+            
+            embed.addFields(
+                { name: '📦 План', value: info.subscription.plan, inline: true },
+                { name: '⏳ Дней осталось', value: daysLeft > 0 ? `${daysLeft}` : 'Истекла', inline: true },
+                { name: '✅ Активна', value: info.subscription.active ? 'Да' : 'Нет', inline: true }
+            );
+        }
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function logToChannel(channelId, embed) {
+    try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel) {
+            await channel.send({ embeds: [embed] });
+        }
+    } catch (error) {
+        console.error('Ошибка отправки в канал:', error);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REST API
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const app = express();
-
-// Middleware - ИСПРАВЛЕНО: Полная поддержка CORS
-app.use(cors({
-    origin: '*', // Разрешить все домены
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-secret'],
-    credentials: true
-}));
+app.use(cors());
 app.use(express.json());
 
-// Обработка preflight requests
-app.options('*', cors());
-
-// Auth middleware
-const authenticateAPI = (req, res, next) => {
-    const secret = req.headers['x-api-secret'];
-    if (secret !== CONFIG.API_SECRET) {
+// Middleware для проверки API ключа
+const apiAuth = (req, res, next) => {
+    const apiKey = req.headers['x-api-key'];
+    if (apiKey !== CONFIG.API_SECRET) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     next();
 };
 
-// Root route - Status page
-app.get('/', (req, res) => {
-    const uptime = process.uptime();
-    const hours = Math.floor(uptime / 3600);
-    const minutes = Math.floor((uptime % 3600) / 60);
-    const seconds = Math.floor(uptime % 60);
+// GET /api/subscription/:userId - Проверка подписки
+app.get('/api/subscription/:userId', apiAuth, (req, res) => {
+    try {
+        const { userId } = req.params;
+        const sub = db.getSubscription(userId);
+        const banned = db.isUserBanned(userId);
 
-    res.send(`
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BadgRules Bot API - Status</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #fff;
-            padding: 20px;
+        if (banned) {
+            return res.json({
+                active: false,
+                banned: true,
+                message: 'User is banned'
+            });
         }
-        .container {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-            max-width: 600px;
-            width: 100%;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }
-        h1 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            text-align: center;
-        }
-        .status {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            margin: 20px 0;
-            font-size: 1.2em;
-        }
-        .status-dot {
-            width: 12px;
-            height: 12px;
-            background: #00ff00;
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        .info {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            padding: 20px;
-            margin: 20px 0;
-        }
-        .info-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        .info-row:last-child {
-            border-bottom: none;
-        }
-        .label {
-            opacity: 0.8;
-        }
-        .value {
-            font-weight: bold;
-        }
-        .endpoints {
-            margin-top: 30px;
-        }
-        .endpoint {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 8px;
-            padding: 15px;
-            margin: 10px 0;
-            font-family: 'Courier New', monospace;
-        }
-        .method {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 0.8em;
-            font-weight: bold;
-            margin-right: 10px;
-        }
-        .get { background: #61affe; }
-        .post { background: #49cc90; }
-        .footer {
-            text-align: center;
-            margin-top: 30px;
-            opacity: 0.7;
-            font-size: 0.9em;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🤖 BadgRules Bot</h1>
-        <div class="status">
-            <div class="status-dot"></div>
-            <span>API Online</span>
-        </div>
 
-        <div class="info">
-            <div class="info-row">
-                <span class="label">Uptime:</span>
-                <span class="value">${hours}h ${minutes}m ${seconds}s</span>
-            </div>
-            <div class="info-row">
-                <span class="label">Version:</span>
-                <span class="value">2.0.0 (Node.js)</span>
-            </div>
-            <div class="info-row">
-                <span class="label">Bot Status:</span>
-                <span class="value">${client.user ? '✅ Connected' : '❌ Disconnected'}</span>
-            </div>
-            <div class="info-row">
-                <span class="label">Bot Name:</span>
-                <span class="value">${client.user ? client.user.tag : 'N/A'}</span>
-            </div>
-        </div>
+        if (!sub) {
+            return res.json({
+                active: false,
+                banned: false,
+                message: 'No subscription found'
+            });
+        }
 
-        <div class="endpoints">
-            <h3>📡 API Endpoints:</h3>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <span>/api/health</span>
-            </div>
+        const expires = new Date(sub.expires_at);
+        const now = new Date();
+        const isActive = expires > now && sub.active && !sub.frozen;
 
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <span>/api/subscription/:userId</span>
-            </div>
-
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <span>/api/subscriptions</span>
-            </div>
-
-            <div class="endpoint">
-                <span class="method post">POST</span>
-                <span>/api/log</span>
-            </div>
-
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <span>/api/logs</span>
-            </div>
-        </div>
-
-        <div class="footer">
-            Made with ❤️ by BadgRules Team
-        </div>
-    </div>
-</body>
-</html>
-    `);
-});
-
-// API Routes
-app.get('/api/subscription/:userId', authenticateAPI, (req, res) => {
-    const { userId } = req.params;
-    const userInfo = db.getUserInfo(userId);
-
-    console.log(`📡 API: Запрос подписки для ${userId}`);
-    console.log(`   Banned: ${userInfo.banned}`);
-    if (userInfo.banned) {
-        console.log(`   Ban Info:`, userInfo.ban_info);
+        res.json({
+            active: isActive,
+            banned: false,
+            subscription: {
+                plan: sub.plan,
+                type: sub.type,
+                expires_at: sub.expires_at,
+                frozen: sub.frozen || false,
+                days_left: Math.max(0, Math.ceil((expires - now) / (1000 * 60 * 60 * 24)))
+            }
+        });
+    } catch (error) {
+        console.error('API Error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-    
-    res.json({
-        user_id: userId,
-        subscription: userInfo.subscription,
-        banned: userInfo.banned,
-        ban_info: userInfo.ban_info
-    });
 });
 
-app.get('/api/subscriptions', authenticateAPI, (req, res) => {
-    const filter = req.query.filter || 'all';
-    const subs = db.getAllSubscriptions(filter);
-    
-    res.json({
-        subscriptions: subs,
-        count: Object.keys(subs).length
-    });
-});
-
-app.post('/api/log', authenticateAPI, async (req, res) => {
-    const { event_type, user_id, data } = req.body;
-    
-    const log = await db.addLog(event_type, user_id, data);
-    
-    // Отправить в Discord канал
-    const channel = client.channels.cache.get(CONFIG.LOGS_CHANNEL_ID);
-    if (channel) {
-        const embed = new EmbedBuilder()
-            .setTitle(`📝 ${event_type}`)
-            .setDescription(`User ID: \`${user_id}\``)
-            .setColor('#0099ff')
-            .setTimestamp();
-
-        for (const [key, value] of Object.entries(data)) {
-            embed.addFields({ name: key, value: String(value).substring(0, 1024) });
-        }
-
-        await channel.send({ embeds: [embed] });
+// GET /api/subscriptions - Список всех подписок
+app.get('/api/subscriptions', apiAuth, (req, res) => {
+    try {
+        const filter = req.query.filter || 'all';
+        const subs = db.getAllSubscriptions(filter);
+        res.json(subs);
+    } catch (error) {
+        console.error('API Error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-    
-    res.json({ status: 'ok', log: log });
 });
 
-app.get('/api/logs', authenticateAPI, (req, res) => {
-    const limit = parseInt(req.query.limit) || 50;
-    const logs = db.getLogs(limit);
-    
-    res.json({ logs: logs, count: logs.length });
-});
-
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime() });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// WEBSITE LOGS API - Логи с сайта
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// In-memory хранилище логов с сайта
-let websiteLogs = {
-    logs: [],
-    errors: [],
-    warnings: [],
-    infos: [],
-    stats: {
-        total: 0,
-        errors: 0,
-        warnings: 0,
-        infos: 0,
-        startTime: new Date().toISOString(),
-        uptime: '0h 0m 0s'
+// GET /api/user/:userId - Информация о пользователе
+app.get('/api/user/:userId', apiAuth, (req, res) => {
+    try {
+        const { userId } = req.params;
+        const info = db.getUserInfo(userId);
+        res.json(info);
+    } catch (error) {
+        console.error('API Error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-};
-
-const serverStartTime = new Date();
-
-function getTimeSinceStart() {
-    const diff = new Date() - serverStartTime;
-    const seconds = Math.floor(diff / 1000);
-    const minutes = Math.floor(seconds / 60);
-    const hours = Math.floor(minutes / 60);
-    return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
-}
-
-function exportLogsToText(logs, type) {
-    let output = '';
-    output += '╔════════════════════════════════════════════════════════════════╗\n';
-    output += '║              BADGRULES - ЛОГИ САЙТА                            ║\n';
-    output += '╚════════════════════════════════════════════════════════════════╝\n\n';
-    output += `📊 Тип: ${type}\n`;
-    output += `📝 Количество: ${logs.length}\n`;
-    output += `⏱️ Время работы: ${getTimeSinceStart()}\n\n`;
-    output += '─'.repeat(70) + '\n\n';
-
-    logs.forEach((log) => {
-        const icon = { 'error': '🔴', 'warn': '🟡', 'info': '🔵', 'log': '⚪', 'debug': '🟣' }[log.type] || '⚪';
-        output += `${icon} [${log.type.toUpperCase()}] ${log.timeFromStart || ''}\n`;
-        output += `   ${new Date(log.timestamp).toLocaleString('ru-RU')}\n`;
-        output += `   ${log.message}\n\n`;
-    });
-
-    return output;
-}
-
-// POST /api/website-log - Принимает логи с фронтенда
-app.post('/api/website-log', (req, res) => {
-    const { type, message, timestamp } = req.body;
-    
-    // Логируем получение данных
-    console.log(`📝 [WEBSITE LOG] Получен лог: [${type}] ${message ? message.substring(0, 50) : 'empty'}...`);
-    
-    if (!type || !message) {
-        console.log('❌ [WEBSITE LOG] Ошибка: type или message отсутствует');
-        return res.status(400).json({ error: 'Type and message required' });
-    }
-
-    const logEntry = {
-        type,
-        message,
-        timestamp: timestamp || new Date().toISOString(),
-        timeFromStart: getTimeSinceStart()
-    };
-
-    websiteLogs.logs.push(logEntry);
-    
-    switch(type) {
-        case 'error':
-            websiteLogs.errors.push(logEntry);
-            websiteLogs.stats.errors++;
-            console.log(`🔴 [WEBSITE LOG] Ошибка добавлена: ${websiteLogs.errors.length} всего`);
-            break;
-        case 'warn':
-            websiteLogs.warnings.push(logEntry);
-            websiteLogs.stats.warnings++;
-            console.log(`🟡 [WEBSITE LOG] Предупреждение добавлено: ${websiteLogs.warnings.length} всего`);
-            break;
-        case 'info':
-            websiteLogs.infos.push(logEntry);
-            websiteLogs.stats.infos++;
-            break;
-    }
-
-    websiteLogs.stats.total++;
-    console.log(`✅ [WEBSITE LOG] Всего логов: ${websiteLogs.stats.total}`);
-
-
-    // Ограничиваем размер (последние 1000 логов)
-    if (websiteLogs.logs.length > 1000) websiteLogs.logs.shift();
-    if (websiteLogs.errors.length > 500) websiteLogs.errors.shift();
-    if (websiteLogs.warnings.length > 500) websiteLogs.warnings.shift();
-
-    res.json({ status: 'ok', logged: true });
 });
 
-// GET /api/website-logs - Получить логи
-app.get('/api/website-logs', authenticateAPI, (req, res) => {
-    const type = req.query.type || 'all';
-    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-
-    let logsToReturn;
-    
-    switch(type) {
-        case 'errors':
-            logsToReturn = websiteLogs.errors.slice(-limit).reverse();
-            break;
-        case 'warnings':
-            logsToReturn = websiteLogs.warnings.slice(-limit).reverse();
-            break;
-        case 'info':
-            logsToReturn = websiteLogs.infos.slice(-limit).reverse();
-            break;
-        case 'stats':
-            websiteLogs.stats.uptime = getTimeSinceStart();
-            return res.json({ stats: websiteLogs.stats });
-        default:
-            logsToReturn = websiteLogs.logs.slice(-limit).reverse();
+// POST /api/log - Добавить лог
+app.post('/api/log', apiAuth, async (req, res) => {
+    try {
+        const { action, userId, adminId, details } = req.body;
+        await db.addLog(action, userId, adminId, details);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('API Error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-
-    const fullText = exportLogsToText(logsToReturn, type);
-    websiteLogs.stats.uptime = getTimeSinceStart();
-
-    res.json({
-        logs: logsToReturn,
-        stats: websiteLogs.stats,
-        fullText: fullText,
-        count: logsToReturn.length
-    });
 });
 
-// POST /api/website-logs/clear - Очистить логи
-app.post('/api/website-logs/clear', authenticateAPI, (req, res) => {
-    websiteLogs = {
-        logs: [], errors: [], warnings: [], infos: [],
-        stats: { total: 0, errors: 0, warnings: 0, infos: 0, startTime: new Date().toISOString(), uptime: '0h 0m 0s' }
-    };
-    res.json({ status: 'ok', message: 'Все логи очищены' });
-});
-
-// Start server
-app.listen(CONFIG.API_PORT, '0.0.0.0', () => {
+// Запуск API сервера
+app.listen(CONFIG.API_PORT, () => {
     console.log(`✅ API сервер запущен на порту ${CONFIG.API_PORT}`);
-    console.log(`🌐 CORS включён - разрешены запросы с любого origin`);
 });
 
-// Login bot
-client.login(CONFIG.BOT_TOKEN).catch(error => {
-    console.error('❌ Ошибка входа:', error);
-    process.exit(1);
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOT STARTUP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+client.once('ready', async () => {
+    console.log(`✅ Бот запущен как ${client.user.tag}`);
+    console.log(`🔒 Debug mode: ${DEBUG.enabled ? 'ENABLED' : 'DISABLED'}`);
+    await registerCommands();
 });
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\n🛑 Остановка бота...');
-    await db.saveAll();
-    client.destroy();
-    process.exit(0);
-});
+client.login(CONFIG.BOT_TOKEN);
